@@ -321,13 +321,13 @@ def sheets_update_category():
 # ── Plaid endpoints (unchanged from before) ───────────────────────────────────
 
 env_map = {
-    'sandbox':     plaid.Environment.Sandbox,
-    'development': plaid.Environment.Development,
-    'production':  plaid.Environment.Production,
+    'sandbox':     'https://sandbox.plaid.com',
+    'development': 'https://development.plaid.com',
+    'production':  'https://production.plaid.com',
 }
 PLAID_ENV = os.getenv('PLAID_ENV', 'sandbox')
 configuration = plaid.Configuration(
-    host=env_map.get(PLAID_ENV, plaid.Environment.Sandbox),
+    host=env_map.get(PLAID_ENV, 'https://sandbox.plaid.com'),
     api_key={
         'clientId': os.getenv('PLAID_CLIENT_ID', ''),
         'secret':   os.getenv('PLAID_SECRET', ''),
