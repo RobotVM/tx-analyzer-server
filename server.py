@@ -47,26 +47,15 @@ load_dotenv()
 
 app = Flask(__name__)
 app.secret_key = os.getenv('SECRET_KEY', 'dev-secret-change-this')
-CORS(app, supports_credentials=True, origins=[
-    os.getenv('FRONTEND_URL', 'http://localhost:5000'),
-    'null',           # local file:// access during development
-    'http://localhost:8080',
-])
+CORS(app, origins='*')
 
-# ── Google OAuth config ───────────────────────────────────────────────────────
-# Scopes: read/write spreadsheets, read user email (to confirm identity)
-SCOPES = [
-    'https://www.googleapis.com/auth/spreadsheets',
-    'https://www.googleapis.com/auth/userinfo.email',
-    'openid',
-]
-SHEET_ID      = os.getenv('GOOGLE_SHEET_ID', '')
-SHEET_TAB     = 'Transactions'   # Tab name in your Google Sheet
-FRONTEND_URL  = os.getenv('FRONTEND_URL', 'http://localhost:5000')
-
-# Column layout in the Transactions sheet (1-indexed for Sheets API, 0-indexed here)
-# date | description | amount | category | source | fingerprint
-SHEET_HEADERS = ['Date', 'Description', 'Amount', 'Category', 'Source', 'Fingerprint']
+# ── In-memory token store (replaces session cookies, works cross-origin) ──────
+# Maps auth_token → google credentials dict
+# auth_token is a random string generated at login, passed back to the browser
+# in the redirect URL, then sent as ?token=... on every API call.
+import secrets
+google_tokens = {}   # { token: credentials_dict }
+plaid_access_tokens = {}
 
 
 def get_google_flow():
@@ -85,9 +74,9 @@ def get_google_flow():
     return flow
 
 
-def get_sheets_service():
-    """Build an authenticated Sheets API client from the stored session token."""
-    creds_data = session.get('google_credentials')
+def get_sheets_service(token):
+    """Build an authenticated Sheets API client from the stored token."""
+    creds_data = google_tokens.get(token)
     if not creds_data:
         return None
     creds = Credentials(**creds_data)
@@ -130,22 +119,24 @@ def google_login():
     """Step 1: Redirect the user to Google's sign-in page."""
     flow = get_google_flow()
     auth_url, state = flow.authorization_url(
-        access_type='offline',       # Get a refresh token so we don't re-auth constantly
+        access_type='offline',
         include_granted_scopes='true',
         prompt='consent'
     )
-    session['oauth_state'] = state
+    # Store state temporarily in a simple dict keyed by state value
+    google_tokens['_state_' + state] = state
     return redirect(auth_url)
 
 
 @app.route('/api/google/callback')
 def google_callback():
-    """Step 2: Google redirects back here with an auth code. Exchange it for tokens."""
+    """Step 2: Exchange auth code for tokens, generate an auth token for the browser."""
     flow = get_google_flow()
     flow.fetch_token(authorization_response=request.url)
     creds = flow.credentials
-    # Store credentials in the session (server-side only)
-    session['google_credentials'] = {
+    # Generate a random token the browser will store in localStorage
+    auth_token = secrets.token_urlsafe(32)
+    google_tokens[auth_token] = {
         'token':         creds.token,
         'refresh_token': creds.refresh_token,
         'token_uri':     creds.token_uri,
@@ -153,14 +144,33 @@ def google_callback():
         'client_secret': creds.client_secret,
         'scopes':        list(creds.scopes),
     }
-    # Redirect back to the HTML app with a success flag
-    return redirect(FRONTEND_URL + '?google=connected')
+    # Redirect back to the HTML app with the token in the URL
+    # The app stores it in localStorage and sends it with every API call
+    return redirect(FRONTEND_URL + '/api/google/landing?token=' + auth_token)
+
+
+@app.route('/api/google/landing')
+def google_landing():
+    """Intermediate page that passes the token back to the local HTML file."""
+    token = request.args.get('token', '')
+    # Redirect to wherever the HTML file is (could be file:// or hosted)
+    # The token goes in the URL hash so it's never sent to a server
+    referrer = request.args.get('origin', FRONTEND_URL)
+    html = f"""<!DOCTYPE html><html><body>
+<script>
+  localStorage.setItem('txAnalyzer_googleToken', '{token}');
+  window.opener && window.opener.postMessage({{type:'google_auth',token:'{token}'}}, '*');
+  document.write('<p>Connected! You can close this tab.</p>');
+  setTimeout(function(){{window.close();}}, 1500);
+</script>
+</body></html>"""
+    return html
 
 
 @app.route('/api/google/status')
 def google_status():
-    """Let the frontend check if Google is connected and which sheet is linked."""
-    connected = 'google_credentials' in session
+    token = request.args.get('token', '')
+    connected = token in google_tokens
     return jsonify({
         'connected': connected,
         'sheet_id':  SHEET_ID if connected else None,
@@ -170,8 +180,8 @@ def google_status():
 
 @app.route('/api/google/logout')
 def google_logout():
-    """Disconnect Google — removes tokens from session."""
-    session.pop('google_credentials', None)
+    token = request.args.get('token', '')
+    google_tokens.pop(token, None)
     return jsonify({'status': 'disconnected'})
 
 
@@ -179,71 +189,43 @@ def google_logout():
 
 @app.route('/api/sheets/transactions', methods=['GET'])
 def sheets_read():
-    """
-    Pull all transactions from the Google Sheet.
-    Returns them in the same normalized shape the HTML app already understands,
-    so no changes needed on the frontend.
-    """
-    service = get_sheets_service()
+    token = request.args.get('token', '')
+    service = get_sheets_service(token)
     if not service:
         return jsonify({'error': 'Google not connected'}), 401
-
     ensure_sheet_headers(service)
-
     result = service.spreadsheets().values().get(
         spreadsheetId=SHEET_ID,
-        range=f'{SHEET_TAB}!A2:F'   # Skip header row
+        range=f'{SHEET_TAB}!A2:F'
     ).execute()
-
     rows = result.get('values', [])
     transactions = []
     for i, row in enumerate(rows):
-        # Pad short rows (in case some columns are empty)
         while len(row) < 6:
             row.append('')
         transactions.append({
-            'id':           i,
-            'date':         row[0],
-            'desc':         row[1],
-            'amount':       float(row[2]) if row[2] else 0,
-            'category':     row[3],
-            'src':          row[4],
-            'fp':           row[5],
-            'origCategory': row[3],  # Already categorized when stored
-            'wasLearned':   False,
+            'id': i, 'date': row[0], 'desc': row[1],
+            'amount': float(row[2]) if row[2] else 0,
+            'category': row[3], 'src': row[4], 'fp': row[5],
+            'origCategory': row[3], 'wasLearned': False,
         })
-
     return jsonify({'transactions': transactions, 'total': len(transactions)})
 
 
 @app.route('/api/sheets/transactions', methods=['POST'])
 def sheets_write():
-    """
-    Merge new transactions into the Google Sheet.
-    The frontend sends { transactions: [...] } — we deduplicate by fingerprint
-    and append only the new ones. Returns { added, skipped }.
-    """
-    service = get_sheets_service()
+    token = request.args.get('token', '')
+    service = get_sheets_service(token)
     if not service:
         return jsonify({'error': 'Google not connected'}), 401
-
     ensure_sheet_headers(service)
-
     new_txns = request.json.get('transactions', [])
     if not new_txns:
         return jsonify({'added': 0, 'skipped': 0})
-
-    # Read existing fingerprints to deduplicate
     existing = service.spreadsheets().values().get(
-        spreadsheetId=SHEET_ID,
-        range=f'{SHEET_TAB}!F2:F'   # Fingerprint column only (fast)
+        spreadsheetId=SHEET_ID, range=f'{SHEET_TAB}!F2:F'
     ).execute()
-    existing_fps = set()
-    for row in existing.get('values', []):
-        if row:
-            existing_fps.add(row[0])
-
-    # Build rows to append — skip any fingerprint already in the sheet
+    existing_fps = set(row[0] for row in existing.get('values', []) if row)
     rows_to_add = []
     skipped = 0
     for t in new_txns:
@@ -252,82 +234,53 @@ def sheets_write():
             skipped += 1
             continue
         existing_fps.add(fp)
-        # Format date consistently
         d = t.get('date', '')
         if isinstance(d, str) and 'T' in d:
-            d = d[:10]  # ISO format → YYYY-MM-DD
-        rows_to_add.append([
-            d,
-            t.get('desc', ''),
-            str(t.get('amount', 0)),
-            t.get('category', 'Other'),
-            t.get('src', 'csv'),
-            fp,
-        ])
-
+            d = d[:10]
+        rows_to_add.append([d, t.get('desc',''), str(t.get('amount',0)),
+                            t.get('category','Other'), t.get('src','csv'), fp])
     if rows_to_add:
         service.spreadsheets().values().append(
-            spreadsheetId=SHEET_ID,
-            range=f'{SHEET_TAB}!A1',
-            valueInputOption='RAW',
-            insertDataOption='INSERT_ROWS',
+            spreadsheetId=SHEET_ID, range=f'{SHEET_TAB}!A1',
+            valueInputOption='RAW', insertDataOption='INSERT_ROWS',
             body={'values': rows_to_add}
         ).execute()
-
     return jsonify({'added': len(rows_to_add), 'skipped': skipped})
 
 
 @app.route('/api/sheets/update_category', methods=['POST'])
 def sheets_update_category():
-    """
-    Update a single transaction's category in the sheet.
-    Called when the user re-categorizes a transaction in the app.
-    Matches by fingerprint, updates column D (Category).
-    """
-    service = get_sheets_service()
+    token = request.args.get('token', '')
+    service = get_sheets_service(token)
     if not service:
         return jsonify({'error': 'Google not connected'}), 401
-
-    fp       = request.json.get('fp')
-    new_cat  = request.json.get('category')
+    fp = request.json.get('fp')
+    new_cat = request.json.get('category')
     if not fp or not new_cat:
         return jsonify({'error': 'Missing fp or category'}), 400
-
-    # Find the row with this fingerprint
     fps = service.spreadsheets().values().get(
-        spreadsheetId=SHEET_ID,
-        range=f'{SHEET_TAB}!F2:F'
+        spreadsheetId=SHEET_ID, range=f'{SHEET_TAB}!F2:F'
     ).execute().get('values', [])
-
-    row_index = None
-    for i, row in enumerate(fps):
-        if row and row[0] == fp:
-            row_index = i + 2  # +2 because we skip header and 0-index
-            break
-
+    row_index = next((i+2 for i, row in enumerate(fps) if row and row[0]==fp), None)
     if row_index is None:
         return jsonify({'error': 'Transaction not found'}), 404
-
     service.spreadsheets().values().update(
-        spreadsheetId=SHEET_ID,
-        range=f'{SHEET_TAB}!D{row_index}',
-        valueInputOption='RAW',
-        body={'values': [[new_cat]]}
+        spreadsheetId=SHEET_ID, range=f'{SHEET_TAB}!D{row_index}',
+        valueInputOption='RAW', body={'values': [[new_cat]]}
     ).execute()
-
     return jsonify({'status': 'updated', 'row': row_index})
 
 
 # ── Plaid endpoints (unchanged from before) ───────────────────────────────────
 
 env_map = {
-    'sandbox':     plaid.Environment.Sandbox,
-    'development': plaid.Environment.Development,
-    'production':  plaid.Environment.Production,
+    'sandbox':     'https://sandbox.plaid.com',
+    'development': 'https://development.plaid.com',
+    'production':  'https://production.plaid.com',
 }
 PLAID_ENV = os.getenv('PLAID_ENV', 'sandbox')
 configuration = plaid.Configuration(
-    host=env_map.get(PLAID_ENV, plaid.Environment.Sandbox),
+    host=env_map.get(PLAID_ENV, 'https://sandbox.plaid.com'),
     api_key={
         'clientId': os.getenv('PLAID_CLIENT_ID', ''),
         'secret':   os.getenv('PLAID_SECRET', ''),
