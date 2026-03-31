@@ -21,9 +21,9 @@ Deploy free:    Push to GitHub → connect to Railway or Render
     FRONTEND_URL=https://your-app.up.railway.app  # or http://localhost:5000 locally
 """
 
-import os, json, sqlite3
-from datetime import date, timedelta, datetime
-from flask import Flask, request, jsonify, redirect, session, url_for
+import os, json
+from datetime import date, timedelta
+from flask import Flask, request, jsonify, redirect
 from flask_cors import CORS
 from dotenv import load_dotenv
 
@@ -48,6 +48,17 @@ load_dotenv()
 app = Flask(__name__)
 app.secret_key = os.getenv('SECRET_KEY', 'dev-secret-change-this')
 CORS(app, origins='*')
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+SCOPES = [
+    'https://www.googleapis.com/auth/spreadsheets',
+    'https://www.googleapis.com/auth/userinfo.email',
+    'openid',
+]
+SHEET_ID      = os.getenv('GOOGLE_SHEET_ID', '')
+SHEET_TAB     = 'Transactions'
+SHEET_HEADERS = ['Date', 'Description', 'Amount', 'Category', 'Source', 'Fingerprint']
+FRONTEND_URL  = os.getenv('FRONTEND_URL', 'http://localhost:5000')
 
 # ── In-memory token store (replaces session cookies, works cross-origin) ──────
 # Maps auth_token → google credentials dict
